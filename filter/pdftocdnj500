@@ -1,0 +1,270 @@
+#!/bin/bash
+#
+# pdftocdnj500 -- CUPS filter for the HP DesignJet 500 (macOS and Linux).
+#
+# Takes the PDF stream that CUPS produces (application/vnd.cups-pdf, from
+# Apple's cgpdftopdf or cups-filters' pdftopdf),
+# renders it with Ghostscript's "cdnj500" device into HP PCL3GUI raster
+# (the DesignJet 500's native language, no HP-GL/2 card needed) and writes
+# the result to stdout for the usb:// backend.
+#
+# CUPS invokes it as:
+#     pdftocdnj500 job-id user title copies options [file]
+#
+# Job options honoured (from the PPD / print dialog):
+#     PageSize / media          page dimensions, named or Custom.WxH[unit]
+#     cupsPrintQuality          Draft (300 dpi) | Normal (600) | High (600)
+#     print-quality             3 | 4 | 5   (IPP equivalent of the above)
+#     ColorModel                RGB | Gray
+#
+# Exit status: 0 on success, 1 on a non-retryable error (CUPS stops the job).
+
+set -u
+umask 077
+
+log() {
+    # log LEVEL MESSAGE  -> CUPS error_log (LEVEL is DEBUG, INFO, ERROR ...)
+    printf '%s: pdftocdnj500: %s\n' "$1" "$2" >&2
+}
+
+if [ $# -lt 5 ] || [ $# -gt 6 ]; then
+    log ERROR "usage: pdftocdnj500 job-id user title copies options [file]"
+    exit 1
+fi
+
+JOB_ID=$1
+COPIES=$4
+OPTIONS=$5
+INPUT=${6:-}
+
+# Scratch space. cupsd normally exports TMPDIR (macOS: /private/var/spool/
+# cups/tmp, Linux: /var/spool/cups/tmp); inside the macOS sandbox that and
+# the spool are the only writable places, so try candidates in order.
+WORK=""
+for base in "${TMPDIR:-}" /private/var/spool/cups/tmp /var/spool/cups/tmp /private/tmp /tmp; do
+    [ -n "$base" ] && [ -d "$base" ] || continue
+    if WORK=$(mktemp -d "$base/cdnj500.XXXXXX" 2>/dev/null); then
+        break
+    fi
+    WORK=""
+done
+if [ -z "$WORK" ]; then
+    log ERROR "cannot create a temporary directory (TMPDIR='${TMPDIR:-}')"
+    exit 1
+fi
+trap 'rm -rf "$WORK"' EXIT
+log DEBUG "scratch dir $WORK (TMPDIR='${TMPDIR:-}')"
+# Ghostscript puts its own scratch files in $TMPDIR; keep them in ours so a
+# bad inherited TMPDIR cannot make it fail with "Could not open scratch file".
+export TMPDIR=$WORK
+
+# ---------------------------------------------------------------------------
+# Locate a Ghostscript that has the cdnj500 device compiled in.
+#
+# macOS: cupsd runs filters in Apple's sandbox, which only allows reading
+# and executing under /Library/Printers, system paths and the spool, so the
+# installer bundles a static Ghostscript at /Library/Printers/cdnj500/bin/gs.
+# The MacPorts/Homebrew paths only work outside the sandbox (cupsfilter tests).
+# Linux: the distribution's /usr/bin/gs has the contrib devices.
+# ---------------------------------------------------------------------------
+# "gs -h" is captured whole before grepping so an early grep exit can never
+# turn into a SIGPIPE failure of the probe.  No here-strings or here-docs
+# anywhere in this script: bash backs them with a temp file, and inside the
+# macOS sandbox that file creation is denied (seen as "deny file-write-create
+# /sh-thd-...").  printf | grep needs no file.
+GS=""
+for candidate in /Library/Printers/cdnj500/bin/gs /usr/bin/gs /opt/local/bin/gs /opt/homebrew/bin/gs /usr/local/bin/gs; do
+    [ -x "$candidate" ] || continue
+    help_text=$("$candidate" -h 2>/dev/null) || continue
+    if printf '%s\n' "$help_text" | grep -qw cdnj500; then
+        GS=$candidate
+        break
+    fi
+done
+if [ -z "$GS" ]; then
+    log ERROR "no Ghostscript with the cdnj500 device found (macOS: expected the bundled /Library/Printers/cdnj500/bin/gs, re-run install.sh; Linux: install the ghostscript package)"
+    exit 1
+fi
+log DEBUG "using Ghostscript at $GS"
+
+# ---------------------------------------------------------------------------
+# Input: either a file name in argv[6] or the PDF on stdin.
+# ---------------------------------------------------------------------------
+if [ -z "$INPUT" ]; then
+    INPUT=$WORK/input.pdf
+    cat > "$INPUT" || {
+        log ERROR "cannot read job data from stdin"
+        exit 1
+    }
+fi
+
+# ---------------------------------------------------------------------------
+# Option helpers.
+# ---------------------------------------------------------------------------
+
+# job_option NAME -> prints the value given on the job, or nothing.
+job_option() {
+    local token
+    for token in $OPTIONS; do
+        case $token in
+            "$1="*)
+                printf '%s' "${token#*=}"
+                return 0
+                ;;
+        esac
+    done
+    return 1
+}
+
+# ppd_default KEYWORD -> prints the *DefaultKEYWORD value from the PPD.
+ppd_default() {
+    [ -n "${PPD:-}" ] && [ -r "$PPD" ] || return 1
+    sed -n "s/^\\*Default$1:[[:space:]]*//p" "$PPD" | head -n 1 | tr -d '\r'
+}
+
+# Values that get interpolated into sed or gs arguments are restricted to
+# a conservative character set first.
+is_safe_name() {
+    [[ $1 =~ ^[A-Za-z0-9._-]+$ ]]
+}
+
+is_number() {
+    [[ $1 =~ ^[0-9]+(\.[0-9]+)?$ ]]
+}
+
+# ---------------------------------------------------------------------------
+# Page size in PostScript points.
+# ---------------------------------------------------------------------------
+SIZE_NAME=$(job_option PageSize || job_option media || ppd_default PageSize || printf 'A4')
+
+WIDTH_PT=""
+HEIGHT_PT=""
+
+if [[ $SIZE_NAME =~ ^Custom\.([0-9]+(\.[0-9]+)?)x([0-9]+(\.[0-9]+)?)(pt|in|mm|cm|m)?$ ]]; then
+    custom_w=${BASH_REMATCH[1]}
+    custom_h=${BASH_REMATCH[3]}
+    custom_unit=${BASH_REMATCH[5]:-pt}
+    case $custom_unit in
+        pt) factor=1 ;;
+        in) factor=72 ;;
+        mm) factor=2.834645669 ;;
+        cm) factor=28.34645669 ;;
+        m)  factor=2834.645669 ;;
+    esac
+    WIDTH_PT=$(awk -v v="$custom_w" -v f="$factor" 'BEGIN { printf "%.2f", v * f }')
+    HEIGHT_PT=$(awk -v v="$custom_h" -v f="$factor" 'BEGIN { printf "%.2f", v * f }')
+elif is_safe_name "$SIZE_NAME" && [ -n "${PPD:-}" ] && [ -r "$PPD" ]; then
+    # *PaperDimension A4/A4: "595 842"
+    dims=$(sed -n "s/^\\*PaperDimension $SIZE_NAME\\(\\/[^:]*\\)\\{0,1\\}:[[:space:]]*\"\\([0-9.]*\\)[[:space:]]*\\([0-9.]*\\)\".*/\\2 \\3/p" "$PPD" | head -n 1)
+    WIDTH_PT=${dims%% *}
+    HEIGHT_PT=${dims##* }
+fi
+
+if ! is_number "${WIDTH_PT:-x}" || ! is_number "${HEIGHT_PT:-x}"; then
+    log INFO "unknown page size \"$SIZE_NAME\", falling back to A4"
+    WIDTH_PT=595
+    HEIGHT_PT=842
+fi
+
+# ---------------------------------------------------------------------------
+# Print quality -> Ghostscript "Quality" parameter of the cdnj500 device.
+#   -1 = draft 300 dpi, 0 = normal 600 dpi, 1 = best 600 dpi (RET off)
+# ---------------------------------------------------------------------------
+QUALITY_NAME=$(job_option cupsPrintQuality || printf '')
+if [ -z "$QUALITY_NAME" ]; then
+    case $(job_option print-quality || printf '') in
+        3) QUALITY_NAME=Draft ;;
+        4) QUALITY_NAME=Normal ;;
+        5) QUALITY_NAME=High ;;
+        *) QUALITY_NAME=$(ppd_default cupsPrintQuality || printf 'Normal') ;;
+    esac
+fi
+case $QUALITY_NAME in
+    Draft)  GS_QUALITY=-1 ;;
+    High)   GS_QUALITY=1 ;;
+    *)      GS_QUALITY=0 ;;
+esac
+
+# ---------------------------------------------------------------------------
+# Colour model.
+# ---------------------------------------------------------------------------
+COLOR_MODEL=$(job_option ColorModel || ppd_default ColorModel || printf 'RGB')
+
+log DEBUG "job $JOB_ID: size=$SIZE_NAME (${WIDTH_PT}x${HEIGHT_PT} pt) quality=$QUALITY_NAME color=$COLOR_MODEL copies=$COPIES"
+
+# ---------------------------------------------------------------------------
+# Grayscale: convert the PDF to DeviceGray first so every pixel the raster
+# device sees is neutral.  Lossless image filters keep line art crisp.
+# ---------------------------------------------------------------------------
+RENDER_INPUT=$INPUT
+if [ "$COLOR_MODEL" = "Gray" ]; then
+    RENDER_INPUT=$WORK/gray.pdf
+    if ! "$GS" -q -dSAFER -dBATCH -dNOPAUSE -dNOPROMPT \
+            -sDEVICE=pdfwrite \
+            -sColorConversionStrategy=Gray \
+            -dProcessColorModel=/DeviceGray \
+            -dAutoFilterColorImages=false -dColorImageFilter=/FlateEncode \
+            -dAutoFilterGrayImages=false  -dGrayImageFilter=/FlateEncode \
+            -dDownsampleColorImages=false -dDownsampleGrayImages=false \
+            -dAutoRotatePages=/None \
+            -sOutputFile="$RENDER_INPUT" "$INPUT"; then
+        log ERROR "Ghostscript grayscale conversion failed"
+        exit 1
+    fi
+fi
+
+# ---------------------------------------------------------------------------
+# Render to PCL3GUI, one file per page so the PJL header of each page can
+# be adjusted afterwards.
+# ---------------------------------------------------------------------------
+if ! "$GS" -q -dSAFER -dBATCH -dNOPAUSE -dNOPROMPT \
+        -sDEVICE=cdnj500 \
+        -dQuality="$GS_QUALITY" \
+        -dDEVICEWIDTHPOINTS="$WIDTH_PT" -dDEVICEHEIGHTPOINTS="$HEIGHT_PT" \
+        -dFIXEDMEDIA \
+        -sOutputFile="$WORK/page%05d.prn" "$RENDER_INPUT"; then
+    log ERROR "Ghostscript cdnj500 rendering failed"
+    exit 1
+fi
+
+PAGE_FILES=("$WORK"/page*.prn)
+if [ ! -e "${PAGE_FILES[0]}" ]; then
+    log ERROR "Ghostscript produced no pages"
+    exit 1
+fi
+
+# emit_page FILE -> writes one rendered page to stdout.
+# For grayscale jobs the PJL RENDERMODE in the (ASCII) header is switched
+# to GRAYSCALE so the printer uses black ink only.  The header ends with
+# the "@PJL ENTER LANGUAGE=PCL3GUI" line; everything after it is binary
+# and is copied untouched.
+emit_page() {
+    local file=$1 marker offset header_len
+    if [ "$COLOR_MODEL" != "Gray" ]; then
+        cat "$file"
+        return
+    fi
+    marker=$(LC_ALL=C grep -a -b -o 'ENTER LANGUAGE=PCL3GUI' "$file" | head -n 1)
+    if [ -z "$marker" ]; then
+        cat "$file"
+        return
+    fi
+    offset=${marker%%:*}
+    header_len=$((offset + ${#marker} - ${#offset} - 1))
+    LC_ALL=C head -c "$header_len" "$file" | sed 's/RENDERMODE = COLOR/RENDERMODE = GRAYSCALE/'
+    LC_ALL=C tail -c +"$((header_len + 1))" "$file"
+}
+
+# Copies: the PPD declares *cupsManualCopies: True, so the PDF stage
+# (cgpdftopdf) has already replicated the pages.  cupsd still passes the
+# requested count in argv[4]; it must not be applied again here.
+page_count=${#PAGE_FILES[@]}
+for file in "${PAGE_FILES[@]}"; do
+    emit_page "$file" || {
+        log ERROR "write to printer failed"
+        exit 1
+    }
+done
+
+log INFO "job $JOB_ID: sent $page_count page(s) (copies=$COPIES handled upstream) at $([ "$GS_QUALITY" -eq -1 ] && printf 300 || printf 600) dpi"
+exit 0
